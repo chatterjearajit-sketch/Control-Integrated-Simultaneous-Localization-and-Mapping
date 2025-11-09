@@ -1,0 +1,209 @@
+# ALL-IN-ONE MULTI-ROBOT DISTRIBUTED SLAM FRAMEWORK DEMO
+import numpy as np
+import matplotlib.pyplot as plt
+
+#########################
+# 1. UTILITY FUNCTIONS
+#########################
+
+def random_motion_model(x, dt=1.0, noise_std=0.1):
+    """Simple random walk in 2D, x=[x, y]."""
+    dx = np.array([1.0, 0.5]) * dt + np.random.randn(2) * noise_std
+    return x + dx
+
+def plot_2d_ellipse(mean, cov, ax, color='r', alpha=0.4):
+    vals, vecs = np.linalg.eigh(cov)
+    angle = np.degrees(np.arctan2(*vecs[:,0][::-1]))
+    for nsig in [1]:
+        w, h = 2 * nsig * np.sqrt(vals)
+        from matplotlib.patches import Ellipse
+        ell = Ellipse(xy=mean, width=w, height=h, angle=angle, color=color, fill=True, alpha=alpha)
+        ax.add_patch(ell)
+
+#########################
+# 2. DKF CORE
+#########################
+
+def kalman_predict(x, P, F, Q):
+    x_pred = F @ x
+    P_pred = F @ P @ F.T + Q
+    return x_pred, P_pred
+
+def kalman_update(x, P, H, R, z):
+    S = H @ P @ H.T + R
+    K = P @ H.T @ np.linalg.inv(S)
+    x_upd = x + K @ (z - H @ x)
+    P_upd = (np.eye(len(x)) - K @ H) @ P
+    return x_upd, P_upd
+
+def consensus_update(estimates, covariances, weights):
+    x_new = sum(w*x for w, x in zip(weights, estimates))
+    P_new = sum(w*P for w, P in zip(weights, covariances))
+    return x_new, P_new
+
+#########################
+# 3. COVARIANCE INTERSECTION
+#########################
+
+def covariance_intersection(x1, P1, x2, P2, omega):
+    P1_inv, P2_inv = np.linalg.inv(P1), np.linalg.inv(P2)
+    P_fused_inv = omega*P1_inv + (1-omega)*P2_inv
+    P_fused = np.linalg.inv(P_fused_inv)
+    x_fused = P_fused @ (omega*P1_inv@x1 + (1-omega)*P2_inv@x2)
+    return x_fused, P_fused
+
+#########################
+# 4. BANDWIDTH-AWARE INFO SHARING
+#########################
+
+def select_packets(values, sizes, bandwidth):
+    idx = np.argsort(np.array(values)/np.array(sizes))[::-1]
+    selected, used, ids = [], 0, []
+    for i in idx:
+        if used+sizes[i]<=bandwidth:
+            selected.append(values[i])
+            ids.append(i)
+            used += sizes[i]
+    return ids, used
+
+#########################
+# 5. NASH EQUILIBRIUM ACTION SELECTION
+#########################
+
+def overlap_func(u_i, u_js):
+    return np.sum([np.exp(-np.linalg.norm(u_i-u_j)**2) for u_j in u_js])
+
+#########################
+# 6. SIMULATION PARAMETERS
+#########################
+
+np.random.seed(42)
+N, T, D = 3, 40, 2
+true_states = np.zeros((T,N,D))
+estimates = np.zeros((T,N,D))
+covariances = np.zeros((T,N,D,D))
+measurements = np.zeros((T,N,D))
+actions = np.zeros((T,N,D))
+bandwidth = 10  # bytes per step
+
+# F, Q, H, R are shared for all
+F = np.eye(D)
+Q = 0.02 * np.eye(D)
+H = np.eye(D)
+R = 0.25 * np.eye(D)
+P0 = 0.6 * np.eye(D)
+
+# Initial poses
+for i in range(N):
+    true_states[0,i] = np.array([i*2., 0])
+    estimates[0,i] = true_states[0,i] + np.random.randn(D)*0.4
+    covariances[0,i] = P0
+    actions[0,i] = np.random.randn(D)
+
+#########################
+# 7. MAIN SIMULATION LOOP
+#########################
+
+nash_overlaps = []
+consensus_errors = []
+bandwidth_used = []
+
+for t in range(1, T):
+    # 1. True states evolve (each robot)
+    for i in range(N):
+        true_states[t,i] = random_motion_model(true_states[t-1,i])
+
+    # 2. Measurements (noisy obs) 
+    for i in range(N):
+        measurements[t,i] = true_states[t,i] + np.random.randn(D)*0.6
+
+    # 3. DKF prediction
+    x_preds, P_preds = [], []
+    for i in range(N):
+        x_pred, P_pred = kalman_predict(estimates[t-1,i], covariances[t-1,i], F, Q)
+        x_preds.append(x_pred)
+        P_preds.append(P_pred)
+    
+    # 4. DKF update (local)
+    for i in range(N):
+        est, cov = kalman_update(x_preds[i], P_preds[i], H, R, measurements[t,i])
+        estimates[t,i] = est
+        covariances[t,i] = cov
+
+    # 5. Consensus (single round, simple weights)
+    weights = [1/N]*N
+    x_consensus, P_consensus = consensus_update(list(estimates[t]), list(covariances[t]), weights)
+    consensus_errors.append(np.max([np.linalg.norm(estimates[t,i]-x_consensus) for i in range(N)]))
+
+    # 6. Covariance Intersection on one pair
+    i,j = 0,1
+    omega = 0.6
+    x_fused, P_fused = covariance_intersection(estimates[t,i], covariances[t,i], estimates[t,j], covariances[t,j], omega)
+
+    # 7. Bandwidth-aware info sharing (fake values/sizes, show selection)
+    info_values = [np.abs(np.random.randn())+1 for _ in range(4)]
+    info_sizes = [np.random.randint(1, 8) for _ in range(4)]
+    sel_ids, bw = select_packets(info_values, info_sizes, bandwidth)
+    bandwidth_used.append(bw)
+
+    # 8. Nash equilibrium action selection (just illustrates role)
+    candidate_us = [np.random.randn(D) for _ in range(6)]
+    overlaps = []
+    for i in range(N):
+        others = [actions[t-1,j] for j in range(N) if j!=i]
+        best = max(candidate_us, key=lambda u: +3/(1+np.linalg.norm(u-actions[t-1,i])**2) - 2*overlap_func(u, others))
+        actions[t,i] = best
+        overlaps.append(overlap_func(actions[t,i], others))
+    nash_overlaps.append(np.mean(overlaps))
+
+#########################
+# 8. GRAPHICAL OUTPUTS
+#########################
+import matplotlib.patches as mpatches
+
+# 1. Robot trajectories, estimates, measurements, and 2-sigma ellipses
+plt.figure(figsize=(10,6))
+colors = ['r','g','b']
+for i in range(N):
+    plt.plot(true_states[:,i,0], true_states[:,i,1], '-', color=colors[i], label=f'Robot {i+1} True')
+    plt.plot(estimates[:,i,0], estimates[:,i,1], '--', color=colors[i], label=f'Robot {i+1} Estimate')
+    plt.scatter(measurements[:,i,0], measurements[:,i,1], marker='o', s=14, color=colors[i], alpha=0.17)
+    for t2 in range(0, T, 8):
+        plot_2d_ellipse(estimates[t2,i], covariances[t2,i], plt.gca(), color=colors[i], alpha=0.2)
+plt.xlabel("x"); plt.ylabel("y")
+plt.title("Trajectories, Estimates, and Uncertainty")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# 2. Consensus error plot
+plt.figure()
+plt.plot(consensus_errors, label="Consensus Error (max dist from average)")
+plt.xlabel("Time step"); plt.ylabel("Error norm")
+plt.title("Robot Consensus Error Over Time")
+plt.legend(); plt.grid(True); plt.show()
+
+# 3. Bandwidth usage
+plt.figure()
+plt.plot(bandwidth_used, label="Bandwidth Used This Step")
+plt.xlabel("Time step"); plt.ylabel("Bytes used")
+plt.title("Bandwidth-Aware Info Sharing")
+plt.legend(); plt.grid(True); plt.show()
+
+# 4. Nash equilibrium dynamic (mean overlap penalty)
+plt.figure()
+plt.plot(nash_overlaps, label="Mean Exploration Overlap (Nash Coordination)")
+plt.xlabel("Time step"); plt.ylabel("Overlap Penalty")
+plt.title("Nash Equilibrium Coordination")
+plt.legend(); plt.grid(True); plt.show()
+
+# 5. Covariance Intersection Demo
+plt.figure()
+ci_centers = [estimates[t,0], x_fused]
+ci_colors = ['r', 'k']
+for c, x in zip(ci_colors, ci_centers):
+    plt.scatter(x[0], x[1], color=c)
+plt.title("Covariance Intersection Fusion (Robots 1+2 at final step)")
+plt.xlabel("x"); plt.ylabel("y")
+plt.legend(['Robot 1 Estimate', 'CI Fusion']);
+plt.grid(True); plt.show()
