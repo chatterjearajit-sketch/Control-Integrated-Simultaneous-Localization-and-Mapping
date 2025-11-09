@@ -1,0 +1,259 @@
+# Updated code with graphical outputs for all algorithms.
+# For each demo, added visualizations using matplotlib.
+
+# !pip install networkx
+
+import numpy as np
+import scipy.optimize as opt
+import networkx as nx
+import matplotlib.pyplot as plt
+from typing import List, Dict, Tuple
+
+# =====================================
+# Algorithm 1: Incremental Pose Graph Optimization
+# =====================================
+# Added: Plot the poses before and after optimization.
+
+class PoseGraph:
+    def __init__(self):
+        self.graph = nx.Graph()
+        self.constraints = {}
+
+    def add_pose(self, idx: int, pose: np.ndarray):
+        self.graph.add_node(idx, pose=pose)
+
+    def add_constraint(self, i: int, j: int, z: np.ndarray, omega: np.ndarray):
+        self.constraints[(i, j)] = {'z': z, 'omega': omega}
+        self.graph.add_edge(i, j)
+
+    def compute_constraint_error(self, i: int, j: int) -> np.ndarray:
+        xi = self.graph.nodes[i]['pose']
+        xj = self.graph.nodes[j]['pose']
+        dx = xj[0] - xi[0]
+        dy = xj[1] - xi[1]
+        dtheta = xj[2] - xi[2]
+        cos_th = np.cos(-xi[2])
+        sin_th = np.sin(-xi[2])
+        dx_rot = cos_th * dx - sin_th * dy
+        dy_rot = sin_th * dx + cos_th * dy
+        predicted = np.array([dx_rot, dy_rot, dtheta])
+        z = self.constraints[(i, j)]['z']
+        return z - predicted
+
+    def perform_local_optimization(self, affected_nodes: List[int]):
+        initial_poses = np.concatenate([self.graph.nodes[n]['pose'] for n in affected_nodes])
+
+        def objective(poses_flat: np.ndarray) -> float:
+            poses = poses_flat.reshape((len(affected_nodes), 3))
+            cost = 0.0
+            for idx, n in enumerate(affected_nodes):
+                self.graph.nodes[n]['pose'] = poses[idx]
+            for (i, j), cons in self.constraints.items():
+                if i in affected_nodes or j in affected_nodes:
+                    e = self.compute_constraint_error(i, j)
+                    omega = cons['omega']
+                    cost += np.dot(e.T, np.dot(omega, e))
+            return cost / 2.0
+
+        result = opt.minimize(objective, initial_poses, method='L-BFGS-B')
+        optimized_poses = result.x.reshape((len(affected_nodes), 3))
+        for idx, n in enumerate(affected_nodes):
+            self.graph.nodes[n]['pose'] = optimized_poses[idx]
+
+    def incremental_update(self, i: int, j: int, z: np.ndarray, omega: np.ndarray, tau_accept: float = 1.0):
+        # Plot before
+        self.plot_poses(title="Before Update")
+        
+        self.add_constraint(i, j, z, omega)
+        e = self.compute_constraint_error(i, j)
+        omega_norm = np.dot(e.T, np.dot(omega, e))
+        if omega_norm < tau_accept:
+            affected = list(nx.connected_components(self.graph))[0]
+            self.perform_local_optimization(affected)
+            print(f"Constraint accepted, optimization performed.")
+        else:
+            del self.constraints[(i, j)]
+            self.graph.remove_edge(i, j)
+            print(f"Constraint rejected as outlier.")
+        
+        # Plot after
+        self.plot_poses(title="After Update")
+
+    def plot_poses(self, title: str):
+        poses = np.array([self.graph.nodes[n]['pose'] for n in self.graph.nodes])
+        plt.figure()
+        plt.scatter(poses[:,0], poses[:,1], c='blue')
+        for (i, j) in self.graph.edges:
+            pi = self.graph.nodes[i]['pose'][:2]
+            pj = self.graph.nodes[j]['pose'][:2]
+            plt.plot([pi[0], pj[0]], [pi[1], pj[1]], 'r-')
+        plt.title(title)
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.grid(True)
+        plt.show()
+
+# Demo for Algorithm 1
+pg = PoseGraph()
+pg.add_pose(0, np.array([0.0, 0.0, 0.0]))
+pg.add_pose(1, np.array([1.0, 0.0, 0.0]))
+pg.add_pose(2, np.array([1.0, 1.0, np.pi/2]))
+pg.add_constraint(0, 1, np.array([1.0, 0.0, 0.0]), np.eye(3))
+pg.add_constraint(1, 2, np.array([0.0, 1.0, np.pi/2]), np.eye(3))
+pg.incremental_update(2, 0, np.array([-1.0, -1.0, -np.pi/2]), np.eye(3), tau_accept=10.0)  # Increased tau to accept
+
+# =====================================
+# Algorithm 2: Active Loop Closure Control
+# =====================================
+# Added: Plot the planned trajectory.
+
+class ActiveLoopClosure:
+    def __init__(self, map_estimate: Dict[Tuple[float, float], float],
+                 lambda_loop: float = 1.0, lambda_cost: float = 1.0):
+        self.map = map_estimate
+        self.lambda_loop = lambda_loop
+        self.lambda_cost = lambda_cost
+
+    def get_nearby_locations(self, current_pose: np.ndarray, radius: float = 5.0) -> List[np.ndarray]:
+        candidates = []
+        for _ in range(5):
+            offset = np.random.uniform(-radius, radius, 2)
+            candidates.append(current_pose[:2] + offset)
+        return candidates
+
+    def expected_information_gain(self, candidate: np.ndarray) -> float:
+        pos_tuple = tuple(np.round(candidate, 1))  # Round for matching
+        return self.map.get(pos_tuple, 1.0)
+
+    def loop_closure_probability(self, candidate: np.ndarray) -> float:
+        dist = np.linalg.norm(candidate)
+        return np.exp(-dist / 5.0)
+
+    def path_cost(self, current: np.ndarray, candidate: np.ndarray) -> float:
+        return np.linalg.norm(candidate - current[:2])
+
+    def active_loop_closure_control(self, current_pose: np.ndarray, horizon: int = 3) -> List[np.ndarray]:
+        control_sequence = []
+        trajectory = [current_pose[:2].copy()]
+        current = current_pose.copy()
+        for h in range(1, horizon + 1):
+            candidates = self.get_nearby_locations(current)
+            best_score = -np.inf
+            best_c = None
+            for c in candidates:
+                I_c = self.expected_information_gain(c)
+                P_c = self.loop_closure_probability(c)
+                C_c = self.path_cost(current, c)
+                score = I_c + self.lambda_loop * P_c - self.lambda_cost * C_c
+                if score > best_score:
+                    best_score = score
+                    best_c = c
+            control_sequence.append(best_c - current[:2])
+            current[:2] = best_c
+            trajectory.append(best_c.copy())
+            print(f"Horizon {h}: Selected target {best_c}, score {best_score}")
+        
+        # Plot trajectory
+        self.plot_trajectory(trajectory)
+        return control_sequence
+
+    def plot_trajectory(self, trajectory: List[np.ndarray]):
+        traj = np.array(trajectory)
+        plt.figure()
+        plt.plot(traj[:,0], traj[:,1], 'b-o', label='Trajectory')
+        plt.scatter(traj[0,0], traj[0,1], c='green', marker='s', label='Start')
+        plt.scatter(traj[-1,0], traj[-1,1], c='red', marker='x', label='End')
+        plt.title('Planned Trajectory for Active Loop Closure')
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+# Demo for Algorithm 2
+map_sim = {(0.0,0.0): 0.5, (1.0,1.0): 1.0, (2.0,2.0): 0.8, (3.0,3.0): 0.9, (4.0,4.0): 0.7}
+alc = ActiveLoopClosure(map_sim)
+current_pose = np.array([0.0, 0.0, 0.0])
+controls = alc.active_loop_closure_control(current_pose, horizon=3)
+print("Control Sequence:", controls)
+
+# =====================================
+# Algorithm 3: Multi-Scale Loop Closure Detection
+# =====================================
+# Added: Plot bar chart of similarities for candidates.
+
+class MultiScaleLoopClosure:
+    def __init__(self, global_database: Dict[int, np.ndarray],
+                 local_database: Dict[int, np.ndarray],
+                 global_threshold: float = 0.8, local_threshold: float = 0.9):
+        self.global_db = global_database
+        self.local_db = local_database
+        self.global_thresh = global_threshold
+        self.local_thresh = local_threshold
+
+    def extract_global_descriptor(self, observation: np.ndarray) -> np.ndarray:
+        return np.random.randn(128)
+
+    def extract_local_descriptor(self, observation: np.ndarray) -> np.ndarray:
+        return np.random.randn(256)
+
+    def similarity(self, d1: np.ndarray, d2: np.ndarray) -> float:
+        return np.dot(d1, d2) / (np.linalg.norm(d1) * np.linalg.norm(d2))
+
+    def geometric_verification(self, candidate_id: int, observation: np.ndarray) -> bool:
+        return np.random.rand() > 0.2
+
+    def multi_scale_detection(self, observation: np.ndarray, threshold: float = 0.85) -> int or None:
+        d_global = self.extract_global_descriptor(observation)
+        coarse_candidates = []
+        global_sims = {}
+        for loc_id, db_global in self.global_db.items():
+            sim = self.similarity(d_global, db_global)
+            global_sims[loc_id] = sim
+            if sim > self.global_thresh:
+                coarse_candidates.append((loc_id, sim))
+        coarse_candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Plot global similarities
+        self.plot_similarities(global_sims, title='Global Similarities', thresh=self.global_thresh)
+        
+        best_match = None
+        best_sim = -np.inf
+        local_sims = {}
+        for loc_id, _ in coarse_candidates:
+            d_local = self.extract_local_descriptor(observation)
+            db_local = self.local_db[loc_id]
+            local_sim = self.similarity(d_local, db_local)
+            local_sims[loc_id] = local_sim
+            if local_sim > self.local_thresh and local_sim > best_sim:
+                if self.geometric_verification(loc_id, observation):
+                    best_sim = local_sim
+                    best_match = loc_id
+        
+        # Plot local similarities for candidates
+        candidate_sims = {k: local_sims.get(k, 0) for k in [c[0] for c in coarse_candidates]}
+        self.plot_similarities(candidate_sims, title='Local Similarities for Candidates', thresh=self.local_thresh)
+        
+        if best_match is not None and best_sim > threshold:
+            return best_match
+        return None
+
+    def plot_similarities(self, sims: Dict[int, float], title: str, thresh: float):
+        ids = list(sims.keys())
+        values = list(sims.values())
+        plt.figure()
+        plt.bar(ids, values)
+        plt.axhline(y=thresh, color='r', linestyle='--', label='Threshold')
+        plt.title(title)
+        plt.xlabel('Location ID')
+        plt.ylabel('Similarity')
+        plt.legend()
+        plt.show()
+
+# Demo for Algorithm 3
+global_db = {1: np.random.randn(128), 2: np.random.randn(128), 3: np.random.randn(128), 4: np.random.randn(128)}
+local_db = {1: np.random.randn(256), 2: np.random.randn(256), 3: np.random.randn(256), 4: np.random.randn(256)}
+mslc = MultiScaleLoopClosure(global_db, local_db, global_threshold=0.0, local_threshold=0.0)  # Low thresh to have candidates
+observation = np.random.randn(100)
+match = mslc.multi_scale_detection(observation)
+print(f"Detected match: {match}")
