@@ -1,0 +1,240 @@
+#We simulate landmarks, change detection using CUSUM, selective map updates
+# and a basic MPC for navigation
+# Assumptions are made for simulation purposes: 2D landmarks, Gaussian noises, etc.
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from scipy.optimize import minimize
+
+# Section: Dynamic Landmark Modeling
+
+class Landmark:
+    def __init__(self, position, landmark_type='static', sigma=0.1):
+        """
+        Initialize a landmark.
+        - position: np.array (2D for simplicity)
+        - type: 'static', 'quasi-static', 'dynamic'
+        - sigma: noise level
+        """
+        self.static_position = np.array(position)
+        self.current_position = np.array(position)
+        self.type = landmark_type
+        self.sigma = sigma
+        self.delta = np.zeros(2)  # Temporal variation
+        # For quasi-static: A, B, etc.
+        if self.type == 'quasi-static':
+            self.A = -0.01 * np.eye(2)  # Drift matrix (stable)
+            self.B = 0.1 * np.eye(2)
+            self.sigma_diff = 0.05 * np.eye(2)
+        # For dynamic: jump process simplified
+        elif self.type == 'dynamic':
+            self.jump_prob = 0.05
+            self.jump_size = 0.5
+
+    def update(self, dt, env_input=None):
+        """
+        Update landmark position based on type using Euler-Maruyama for SDE.
+        """
+        if self.type == 'static':
+            self.delta += np.random.normal(0, self.sigma, 2) * np.sqrt(dt)
+        elif self.type == 'quasi-static':
+            # dL = A L dt + B u dt + sigma dW
+            drift = self.A @ self.delta * dt
+            if env_input is None:
+                env_input = np.zeros(2)
+            control = self.B @ env_input * dt
+            diffusion = self.sigma_diff @ np.random.normal(0, 1, 2) * np.sqrt(dt)
+            self.delta += drift + control + diffusion
+        elif self.type == 'dynamic':
+            # Simplified jump: with prob, add jump
+            if np.random.rand() < self.jump_prob:
+                self.delta += np.random.uniform(-self.jump_size, self.jump_size, 2)
+            self.delta += np.random.normal(0, self.sigma, 2) * np.sqrt(dt)
+        
+        self.current_position = self.static_position + self.delta
+
+    def observe(self):
+        """Simulate observation with noise."""
+        return self.current_position + np.random.normal(0, 0.1, 2)
+
+# Multi-Scale Temporal Modeling
+def multi_scale_update(delta_fast, delta_medium, delta_slow, alpha_fast=1.0, alpha_medium=0.1, sigma_fast=0.1, sigma_medium=0.05, mu_slow=0.01, sigma_slow=0.01, dt=1.0):
+    """
+    Update multi-scale deltas.
+    """
+    d_fast = -alpha_fast * delta_fast * dt + sigma_fast * np.random.normal(0, 1, 2) * np.sqrt(dt)
+    d_medium = -alpha_medium * delta_medium * dt + sigma_medium * np.random.normal(0, 1, 2) * np.sqrt(dt)
+    d_slow = mu_slow * dt + sigma_slow * np.random.normal(0, 1, 2) * np.sqrt(dt)
+    return delta_fast + d_fast, delta_medium + d_medium, delta_slow + d_slow
+
+# Section: Change Detection Algorithms
+
+def likelihood_ratio(z, sigma=0.1):
+    """
+    Compute log likelihood ratio for change detection.
+    Simplified: assume Delta estimated as z, H0: Delta=0.
+    """
+    # p(z | H1) / p(z | H0), max over Delta is approx when Delta = z
+    p_h0 = norm.pdf(z, 0, sigma)
+    p_h1 = norm.pdf(0, 0, sigma)  # Max when Delta = z, then p(z|H1) = pdf(0,0,sigma)
+    return np.log(p_h1 / p_h0 + 1e-10)  # Avoid div0
+
+def cusum(S_prev, log_lambda, b=0.1):
+    """
+    Adaptive CUSUM.
+    """
+    return max(0, S_prev + log_lambda - b)
+
+def multi_dimensional_cusum(S_list, weights):
+    """
+    Global test statistic.
+    """
+    return np.dot(weights, S_list)
+
+def update_weights(weights, losses, eta=0.1):
+    """
+    Update weights.
+    """
+    return weights * np.exp(-eta * losses)
+
+def robust_cusum(S_prev, log_lambda, b=0.1, tau=5.0):
+    """
+    Robust CUSUM with Huber.
+    """
+    psi = min(tau, max(-tau, log_lambda)) if abs(log_lambda) > tau else log_lambda
+    return max(0, S_prev + psi - b)
+
+# Section: Map Update Strategies
+
+class Map:
+    def __init__(self, landmarks):
+        self.landmarks = landmarks  # List of Landmark objects
+        self.m = len(landmarks)
+        self.positions = np.array([lm.current_position for lm in landmarks])
+
+    def bayesian_update(self, j, z, sigma=0.1):
+        """
+        Simplified Bayesian update for landmark j.
+        Assume prior = current, likelihood = N(z, sigma)
+        Posterior mean = (prior / prior_var + z / sigma) / (1/prior_var + 1/sigma), but simplify to weighted avg.
+        """
+        prior = self.positions[j]
+        updated = 0.5 * prior + 0.5 * z  # Simple average for demo
+        self.positions[j] = updated
+        self.landmarks[j].current_position = updated
+        return updated
+
+    def selective_update(self, S, h, z_list, tau_u=0.1):
+        """
+        Selective Map Update Algorithm.
+        """
+        c = np.zeros(self.m)
+        for j in range(self.m):
+            if S[j] > h[j]:
+                c[j] = 1
+                # Identify affected region: for simplicity, just the landmark
+                # Update local map
+                self.bayesian_update(j, z_list[j])
+        # Propagate: skip for simplicity
+        # Recompute consistency: sum distances
+        C = 0
+        for i in range(self.m):
+            for j in range(i+1, self.m):
+                C += np.linalg.norm(self.positions[i] - self.positions[j])
+        return c, C
+
+# Multi-Hypothesis (simple)
+class MultiHypothesisMap:
+    def __init__(self, num_hypotheses=3, base_map=None):
+        self.hypotheses = [base_map for _ in range(num_hypotheses)]
+        self.pi = np.ones(num_hypotheses) / num_hypotheses
+
+    def update_hypotheses(self, Z):
+        # Simplified: update pi based on likelihood
+        likes = [np.exp(-np.sum((h.positions - Z)**2)) for h in self.hypotheses]
+        self.pi = self.pi * likes / np.sum(self.pi * likes)
+        # Prune, merge, split: skip for simplicity
+
+# Section: Robust Navigation
+
+def adaptive_control_objective(u, x_ref, x, alpha=1, beta=1, gamma=1):
+    """
+    Adaptive control cost.
+    Simplified for scalar u, x.
+    """
+    J_track = (x_ref - x)**2
+    J_explore = -1  # Dummy
+    J_safety = max(0, 0.1 - 0.05)**2  # Dummy
+    J_adapt = u**2  # Dummy smoothness
+    return J_track + alpha * J_explore + beta * J_safety + gamma * J_adapt
+
+def mpc_optimize(x0, x_ref, N=5):
+    """
+    Simple MPC using minimize.
+    Assume 1D state, u.
+    Dynamics: x_{t+1} = x_t + u_t
+    """
+    def cost(U):
+        x = x0
+        total = 0
+        for t in range(N):
+            u = U[t]
+            x = x + u
+            total += (x - x_ref[t])**2 + 0.1 * u**2
+        return total
+    res = minimize(cost, np.zeros(N), bounds=[(-1,1)]*N)
+    return res.x[0]  # First control
+
+# Simulation Example
+def simulate():
+    # Create landmarks
+    landmarks = [
+        Landmark([0,0], 'static'),
+        Landmark([1,1], 'quasi-static'),
+        Landmark([2,2], 'dynamic')
+    ]
+    env_map = Map(landmarks)
+    
+    # Simulate over time
+    dt = 0.1
+    T = 100
+    positions_over_time = []
+    S = [0.0] * 3  # CUSUM for each
+    h = [5.0] * 3  # Thresholds
+    for t in range(T):
+        # Update landmarks
+        for lm in landmarks:
+            lm.update(dt, env_input=np.random.normal(0,0.1,2))
+        
+        # Observations
+        z_list = [lm.observe() for lm in landmarks]
+        
+        # Change detection
+        for j in range(3):
+            innovation = z_list[j] - env_map.positions[j]  # Simplified z as delta
+            log_lambda = likelihood_ratio(np.linalg.norm(innovation))
+            S[j] = cusum(S[j], log_lambda)
+        
+        # Selective update
+        c, C = env_map.selective_update(S, h, z_list)
+        
+        positions_over_time.append(env_map.positions.copy())
+    
+    # Plot
+    positions_over_time = np.array(positions_over_time)
+    for j in range(3):
+        plt.plot(positions_over_time[:, j, 0], label=f'LM{j} x')
+        plt.plot(positions_over_time[:, j, 1], label=f'LM{j} y')
+    plt.legend()
+    plt.show()
+    
+    # MPC example
+    x0 = 0
+    x_ref = np.linspace(0, 10, 5)
+    u = mpc_optimize(x0, x_ref)
+    print(f"Optimal first control: {u}")
+
+# Run simulation
+simulate()
