@@ -1,0 +1,537 @@
+# Information-Theoretic SLAM Control Implementation
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from matplotlib.animation import FuncAnimation
+import math
+from scipy.linalg import block_diag
+from scipy.optimize import minimize_scalar
+import warnings
+warnings.filterwarnings('ignore')
+
+class InformationTheoreticSLAM:
+    """
+    Implementation of Information-Theoretic SLAM Control Algorithm
+    Based on Phase I mathematical framework
+    """
+    
+    def __init__(self, initial_state, landmarks, params):
+        """
+        Initialize the SLAM system
+        
+        Args:
+            initial_state: [x, y, theta] initial robot pose
+            landmarks: Nx2 array of true landmark positions
+            params: dictionary of algorithm parameters
+        """
+        # Robot state: [x, y, theta]
+        self.state_dim = 3
+        self.obs_dim = 2  # range, bearing
+        
+        # True system (hidden from algorithm)
+        self.true_state = np.array(initial_state)
+        self.true_landmarks = np.array(landmarks)
+        self.n_landmarks = len(landmarks)
+        
+        # Algorithm parameters
+        self.dt = params.get('dt', 0.1)
+        self.sensor_range = params.get('sensor_range', 3.0)
+        self.alpha = params.get('alpha', 1.0)  # Information gain weight
+        self.beta = params.get('beta', 0.1)   # Task reward weight
+        self.gamma = params.get('gamma', 0.01) # Control cost weight
+        
+        # Noise parameters
+        self.process_noise = np.diag([0.01, 0.01, 0.05])  # [x, y, theta]
+        self.obs_noise = np.diag([0.1, 0.05])  # [range, bearing]
+        
+        # EKF state estimation
+        # State: [x, y, theta, landmark1_x, landmark1_y, ...]
+        self.full_state_dim = self.state_dim + 2 * self.n_landmarks
+        self.state_est = np.zeros(self.full_state_dim)
+        self.state_est[:3] = initial_state
+        
+        # Initialize landmark estimates (unknown initially)
+        for i in range(self.n_landmarks):
+            self.state_est[3 + 2*i:3 + 2*i + 2] = [0, 0]  # Unknown landmarks
+        
+        # Covariance matrix
+        self.P = np.eye(self.full_state_dim)
+        self.P[:3, :3] *= 0.01  # Small initial pose uncertainty
+        self.P[3:, 3:] *= 100   # Large initial landmark uncertainty
+        
+        # Control space (discretized)
+        self.control_space = self._generate_control_space()
+        
+        # History for visualization
+        self.history = {
+            'states': [self.true_state.copy()],
+            'estimates': [self.state_est.copy()],
+            'covariances': [self.P.copy()],
+            'observations': [],
+            'controls': [],
+            'info_gains': []
+        }
+    
+    def _generate_control_space(self):
+        """Generate discretized control space [v, omega]"""
+        velocities = [0.0, 0.2, 0.4, 0.6]
+        angular_velocities = [-0.5, -0.2, 0.0, 0.2, 0.5]
+        
+        controls = []
+        for v in velocities:
+            for omega in angular_velocities:
+                controls.append([v, omega])
+        
+        return np.array(controls)
+    
+    def unicycle_dynamics(self, state, control):
+        """
+        Unicycle robot dynamics: dx/dt = [v*cos(theta), v*sin(theta), omega]
+        """
+        x, y, theta = state
+        v, omega = control
+        
+        # Dynamics
+        dx = v * np.cos(theta)
+        dy = v * np.sin(theta)
+        dtheta = omega
+        
+        return np.array([dx, dy, dtheta])
+    
+    def step_dynamics(self, state, control, add_noise=True):
+        """Integrate dynamics forward one time step"""
+        # Deterministic step
+        state_dot = self.unicycle_dynamics(state, control)
+        new_state = state + state_dot * self.dt
+        
+        # Normalize angle
+        new_state[2] = self._normalize_angle(new_state[2])
+        
+        # Add process noise
+        if add_noise:
+            noise = np.random.multivariate_normal([0, 0, 0], self.process_noise)
+            new_state += noise
+            new_state[2] = self._normalize_angle(new_state[2])
+        
+        return new_state
+    
+    def observation_model(self, robot_state, landmark_pos):
+        """
+        Range-bearing observation model
+        Returns [range, bearing] to landmark
+        """
+        dx = landmark_pos[0] - robot_state[0]
+        dy = landmark_pos[1] - robot_state[1]
+        
+        range_obs = np.sqrt(dx**2 + dy**2)
+        bearing_obs = math.atan2(dy, dx) - robot_state[2]
+        bearing_obs = self._normalize_angle(bearing_obs)
+        
+        return np.array([range_obs, bearing_obs])
+    
+    def get_observations(self, robot_state):
+        """Get observations to all landmarks within sensor range"""
+        observations = {}
+        
+        for i, landmark in enumerate(self.true_landmarks):
+            obs = self.observation_model(robot_state, landmark)
+            
+            # Check if landmark is within sensor range
+            if obs[0] <= self.sensor_range:
+                # Add measurement noise
+                noise = np.random.multivariate_normal([0, 0], self.obs_noise)
+                noisy_obs = obs + noise
+                noisy_obs[1] = self._normalize_angle(noisy_obs[1])
+                
+                observations[i] = noisy_obs
+        
+        return observations
+    
+    def predict_step(self, control):
+        """EKF Prediction Step"""
+        # State transition jacobian
+        F = self._compute_state_jacobian(self.state_est[:3], control)
+        
+        # Predict state
+        pred_state = self.state_est.copy()
+        pred_state[:3] = self.step_dynamics(pred_state[:3], control, add_noise=False)
+        
+        # Predict covariance
+        # Build full F matrix
+        F_full = np.eye(self.full_state_dim)
+        F_full[:3, :3] = F
+        
+        # Process noise (only affects robot pose)
+        Q_full = np.zeros((self.full_state_dim, self.full_state_dim))
+        Q_full[:3, :3] = self.process_noise
+        
+        pred_P = F_full @ self.P @ F_full.T + Q_full
+        
+        return pred_state, pred_P
+    
+    def update_step(self, pred_state, pred_P, observations):
+        """EKF Update Step"""
+        if not observations:
+            return pred_state, pred_P
+        
+        # Process each observation
+        for landmark_id, obs in observations.items():
+            # Observation jacobian
+            H = self._compute_observation_jacobian(pred_state, landmark_id)
+            
+            # Predicted observation
+            landmark_est = pred_state[3 + 2*landmark_id:3 + 2*landmark_id + 2]
+            pred_obs = self.observation_model(pred_state[:3], landmark_est)
+            
+            # Innovation
+            innovation = obs - pred_obs
+            innovation[1] = self._normalize_angle(innovation[1])
+            
+            # Innovation covariance
+            S = H @ pred_P @ H.T + self.obs_noise
+            
+            # Kalman gain
+            K = pred_P @ H.T @ np.linalg.inv(S)
+            
+            # Update state and covariance
+            pred_state = pred_state + K @ innovation
+            pred_P = (np.eye(self.full_state_dim) - K @ H) @ pred_P
+            
+            # Normalize robot angle
+            pred_state[2] = self._normalize_angle(pred_state[2])
+        
+        return pred_state, pred_P
+    
+    def _compute_state_jacobian(self, state, control):
+        """Compute jacobian of state transition w.r.t. state"""
+        x, y, theta = state
+        v, omega = control
+        
+        F = np.eye(3)
+        F[0, 2] = -v * np.sin(theta) * self.dt
+        F[1, 2] = v * np.cos(theta) * self.dt
+        
+        return F
+    
+    def _compute_observation_jacobian(self, full_state, landmark_id):
+        """Compute jacobian of observation w.r.t. full state"""
+        robot_pos = full_state[:3]
+        landmark_pos = full_state[3 + 2*landmark_id:3 + 2*landmark_id + 2]
+        
+        dx = landmark_pos[0] - robot_pos[0]
+        dy = landmark_pos[1] - robot_pos[1]
+        r = np.sqrt(dx**2 + dy**2)
+        
+        if r < 1e-6:  # Avoid division by zero
+            r = 1e-6
+        
+        # Jacobian w.r.t. robot pose
+        H_robot = np.array([
+            [-dx/r, -dy/r, 0],
+            [dy/r**2, -dx/r**2, -1]
+        ])
+        
+        # Jacobian w.r.t. landmark position
+        H_landmark = np.array([
+            [dx/r, dy/r],
+            [-dy/r**2, dx/r**2]
+        ])
+        
+        # Full jacobian
+        H = np.zeros((2, self.full_state_dim))
+        H[:, :3] = H_robot
+        H[:, 3 + 2*landmark_id:3 + 2*landmark_id + 2] = H_landmark
+        
+        return H
+    
+    def compute_information_gain(self, control):
+        """
+        Compute expected information gain for a given control action
+        """
+        # Predict state after taking control
+        pred_state, pred_P = self.predict_step(control)
+        
+        # Simulate observations
+        pred_robot_state = pred_state[:3]
+        expected_observations = {}
+        
+        for i, landmark in enumerate(self.true_landmarks):
+            landmark_est = pred_state[3 + 2*i:3 + 2*i + 2]
+            obs = self.observation_model(pred_robot_state, landmark_est)
+            
+            # Check if landmark would be observable
+            if obs[0] <= self.sensor_range:
+                expected_observations[i] = obs
+        
+        if not expected_observations:
+            return 0.0
+        
+        # Compute information gain using determinant ratio
+        det_prior = np.linalg.det(pred_P + np.eye(self.full_state_dim) * 1e-6)
+        
+        # Simulate update with expected observations
+        _, post_P = self.update_step(pred_state, pred_P, expected_observations)
+        det_post = np.linalg.det(post_P + np.eye(self.full_state_dim) * 1e-6)
+        
+        # Information gain (bits)
+        info_gain = 0.5 * np.log2(det_prior / max(det_post, 1e-10))
+        
+        return max(info_gain, 0.0)
+    
+    def compute_task_reward(self, control):
+        """Compute task-specific reward (e.g., exploration progress)"""
+        # Simple reward: encourage movement
+        v, omega = control
+        return v  # Reward forward motion
+    
+    def compute_control_cost(self, control):
+        """Compute control cost (energy consumption)"""
+        v, omega = control
+        return v**2 + omega**2
+    
+    def select_optimal_control(self):
+        """
+        Select optimal control using information-theoretic objective
+        """
+        best_control = None
+        best_objective = -np.inf
+        info_gains = []
+        
+        for control in self.control_space:
+            # Compute objective components
+            info_gain = self.compute_information_gain(control)
+            task_reward = self.compute_task_reward(control)
+            control_cost = self.compute_control_cost(control)
+            
+            # Combined objective
+            objective = (self.alpha * info_gain + 
+                        self.beta * task_reward - 
+                        self.gamma * control_cost)
+            
+            info_gains.append(info_gain)
+            
+            if objective > best_objective:
+                best_objective = objective
+                best_control = control
+        
+        return best_control, max(info_gains)
+    
+    def step(self):
+        """Execute one step of the SLAM algorithm"""
+        # Select optimal control
+        control, info_gain = self.select_optimal_control()
+        
+        # Execute control on true system
+        self.true_state = self.step_dynamics(self.true_state, control)
+        
+        # Get observations
+        observations = self.get_observations(self.true_state)
+        
+        # EKF prediction
+        pred_state, pred_P = self.predict_step(control)
+        
+        # EKF update
+        self.state_est, self.P = self.update_step(pred_state, pred_P, observations)
+        
+        # Store history
+        self.history['states'].append(self.true_state.copy())
+        self.history['estimates'].append(self.state_est.copy())
+        self.history['covariances'].append(self.P.copy())
+        self.history['observations'].append(observations)
+        self.history['controls'].append(control)
+        self.history['info_gains'].append(info_gain)
+    
+    def _normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]"""
+        return math.atan2(math.sin(angle), math.cos(angle))
+    
+    def plot_current_state(self, ax):
+        """Plot current state for visualization"""
+        ax.clear()
+        
+        # Plot true landmarks
+        true_lm = self.true_landmarks
+        ax.scatter(true_lm[:, 0], true_lm[:, 1], 
+                  c='red', s=100, marker='*', label='True Landmarks')
+        
+        # Plot estimated landmarks with uncertainty
+        for i in range(self.n_landmarks):
+            lm_est = self.state_est[3 + 2*i:3 + 2*i + 2]
+            lm_cov = self.P[3 + 2*i:3 + 2*i + 2, 3 + 2*i:3 + 2*i + 2]
+            
+            # Uncertainty ellipse
+            if np.linalg.det(lm_cov) > 1e-10:
+                eigenvals, eigenvecs = np.linalg.eigh(lm_cov)
+                angle = np.degrees(np.arctan2(eigenvecs[1, 0], eigenvecs[0, 0]))
+                width, height = 2 * np.sqrt(eigenvals)
+                
+                ellipse = Ellipse(lm_est, width, height, angle=angle,
+                                alpha=0.3, facecolor='blue', edgecolor='blue')
+                ax.add_patch(ellipse)
+            
+            ax.scatter(lm_est[0], lm_est[1], c='blue', s=50, marker='o')
+        
+        # Plot robot trajectory
+        states = np.array(self.history['states'])
+        estimates = np.array(self.history['estimates'])
+        
+        ax.plot(states[:, 0], states[:, 1], 'g-', linewidth=2, label='True Trajectory')
+        ax.plot(estimates[:, 0], estimates[:, 1], 'b--', linewidth=2, label='Estimated Trajectory')
+        
+        # Plot current robot pose
+        current_true = self.true_state
+        current_est = self.state_est[:3]
+        
+        # True robot
+        ax.arrow(current_true[0], current_true[1], 
+                0.3 * np.cos(current_true[2]), 0.3 * np.sin(current_true[2]),
+                head_width=0.1, head_length=0.1, fc='green', ec='green')
+        
+        # Estimated robot
+        ax.arrow(current_est[0], current_est[1], 
+                0.3 * np.cos(current_est[2]), 0.3 * np.sin(current_est[2]),
+                head_width=0.1, head_length=0.1, fc='blue', ec='blue')
+        
+        # Robot uncertainty ellipse
+        robot_cov = self.P[:2, :2]
+        if np.linalg.det(robot_cov) > 1e-10:
+            eigenvals, eigenvecs = np.linalg.eigh(robot_cov)
+            angle = np.degrees(np.arctan2(eigenvecs[1, 0], eigenvecs[0, 0]))
+            width, height = 2 * np.sqrt(eigenvals)
+            
+            ellipse = Ellipse(current_est[:2], width, height, angle=angle,
+                            alpha=0.3, facecolor='cyan', edgecolor='blue')
+            ax.add_patch(ellipse)
+        
+        # Sensor range circle
+        circle = plt.Circle(current_true[:2], self.sensor_range, 
+                           fill=False, color='gray', linestyle='--', alpha=0.5)
+        ax.add_patch(circle)
+        
+        ax.set_xlim(-2, 8)
+        ax.set_ylim(-2, 8)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+
+# Demo Setup and Execution
+def run_slam_demo():
+    """Run the Information-Theoretic SLAM demonstration"""
+    
+    print("�� Information-Theoretic SLAM Control Demo")
+    print("=" * 50)
+    
+    # Environment setup
+    initial_state = [0.0, 0.0, 0.0]  # Start at origin, facing east
+    landmarks = [
+        [2.0, 1.0],
+        [4.0, 3.0], 
+        [1.0, 4.0],
+        [5.0, 1.0],
+        [3.0, 5.0]
+    ]
+    
+    # Algorithm parameters
+    params = {
+        'dt': 0.1,
+        'sensor_range': 3.0,
+        'alpha': 2.0,    # Information gain weight
+        'beta': 0.5,     # Task reward weight  
+        'gamma': 0.1     # Control cost weight
+    }
+    
+    # Initialize SLAM system
+    slam = InformationTheoreticSLAM(initial_state, landmarks, params)
+    
+    print(f"Environment: {len(landmarks)} landmarks")
+    print(f"Sensor range: {params['sensor_range']} m")
+    print(f"Weights - Info: {params['alpha']}, Task: {params['beta']}, Cost: {params['gamma']}")
+    
+    # Set up visualization
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Run simulation
+    n_steps = 150
+    print(f"\nRunning {n_steps} simulation steps...")
+    
+    for step in range(n_steps):
+        slam.step()
+        
+        # Progress indicator
+        if step % 30 == 0:
+            print(f"Step {step}/{n_steps} - Info Gain: {slam.history['info_gains'][-1]:.3f}")
+    
+    print("✅ Simulation complete!")
+    
+    # Generate comprehensive plots
+    states = np.array(slam.history['states'])
+    estimates = np.array(slam.history['estimates'])
+    info_gains = slam.history['info_gains']
+    
+    # Plot 1: Final trajectory and map
+    slam.plot_current_state(ax1)
+    ax1.set_title('Final SLAM Result', fontsize=14, fontweight='bold')
+    
+    # Plot 2: Information gain over time
+    ax2.plot(info_gains, 'purple', linewidth=2)
+    ax2.set_xlabel('Time Step')
+    ax2.set_ylabel('Information Gain (bits)')
+    ax2.set_title('Information Gain Over Time', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Estimation errors
+    position_errors = np.linalg.norm(states[:, :2] - estimates[:, :2], axis=1)
+    angle_errors = np.abs(states[:, 2] - estimates[:, 2])
+    angle_errors = np.minimum(angle_errors, 2*np.pi - angle_errors)  # Wrap angle errors
+    
+    ax3.plot(position_errors, 'red', linewidth=2, label='Position Error')
+    ax3.plot(angle_errors, 'orange', linewidth=2, label='Angle Error')
+    ax3.set_xlabel('Time Step')
+    ax3.set_ylabel('Error')
+    ax3.set_title('Estimation Errors', fontsize=14, fontweight='bold')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Uncertainty evolution (determinant of covariance)
+    covariances = slam.history['covariances']
+    uncertainties = [np.log(np.linalg.det(P[:3, :3]) + 1e-10) for P in covariances]
+    
+    ax4.plot(uncertainties, 'green', linewidth=2)
+    ax4.set_xlabel('Time Step')
+    ax4.set_ylabel('Log Determinant of Pose Covariance')
+    ax4.set_title('Pose Uncertainty Evolution', fontsize=14, fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print final statistics
+    print("\n�� Final Results:")
+    print("-" * 30)
+    final_pos_error = position_errors[-1]
+    final_angle_error = angle_errors[-1]
+    total_info_gain = sum(info_gains)
+    avg_info_gain = np.mean(info_gains)
+    
+    print(f"Final position error: {final_pos_error:.3f} m")
+    print(f"Final angle error: {np.degrees(final_angle_error):.1f}°")
+    print(f"Total information gain: {total_info_gain:.2f} bits")
+    print(f"Average information gain: {avg_info_gain:.3f} bits/step")
+    
+    # Landmark estimation accuracy
+    print(f"\n�� Landmark Estimation Errors:")
+    for i in range(len(landmarks)):
+        true_lm = slam.true_landmarks[i]
+        est_lm = slam.state_est[3 + 2*i:3 + 2*i + 2]
+        error = np.linalg.norm(true_lm - est_lm)
+        print(f"  Landmark {i+1}: {error:.3f} m")
+    
+    return slam
+
+# Execute the demo
+if __name__ == "__main__":
+    slam_system = run_slam_demo()
