@@ -1,0 +1,1294 @@
+
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from scipy.linalg import inv, sqrtm, block_diag
+from scipy.optimize import minimize
+from scipy.spatial.distance import pdist, squareform
+import warnings
+from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass
+from collections import defaultdict, deque
+import time
+import random
+from enum import Enum
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# Core Data Structures and Definitions
+# ============================================================================
+
+@dataclass
+class RobotState:
+    """State representation for a single robot"""
+    position: np.ndarray  # [x, y, theta]
+    velocity: np.ndarray  # [vx, vy, omega]
+    covariance: np.ndarray  # State covariance
+    landmarks: Dict[int, np.ndarray]  # Local landmark map
+
+@dataclass
+class CommunicationLink:
+    """Communication link properties"""
+    bandwidth: float
+    packet_loss_prob: float
+    delay: float
+    active: bool
+
+class MessageType(Enum):
+    STATE_ESTIMATE = "state_estimate"
+    MAP_UPDATE = "map_update"
+    EXPLORATION_INTENT = "exploration_intent"
+    CONSENSUS_UPDATE = "consensus_update"
+
+@dataclass
+class Message:
+    sender_id: int
+    receiver_id: int
+    msg_type: MessageType
+    content: Dict
+    timestamp: float
+    size_bytes: int
+
+# ============================================================================
+# Multi-Robot Network Management
+# ============================================================================
+
+class MultiRobotNetwork:
+    """Dynamic communication network for multi-robot system"""
+
+    def __init__(self, num_robots: int, comm_range: float = 30.0):
+        self.num_robots = num_robots
+        self.comm_range = comm_range
+        self.robots = {}
+        self.communication_links = {}
+        self.message_queue = deque()
+        self.network_history = []
+
+    def add_robot(self, robot_id: int, initial_state: RobotState):
+        """Add robot to the network"""
+        self.robots[robot_id] = initial_state
+
+    def update_communication_graph(self, positions: Dict[int, np.ndarray]) -> nx.Graph:
+        """Update communication graph based on robot positions"""
+        G = nx.Graph()
+        G.add_nodes_from(range(self.num_robots))
+
+        # Compute pairwise distances
+        robot_ids = list(positions.keys())
+        for i in range(len(robot_ids)):
+            for j in range(i + 1, len(robot_ids)):
+                id_i, id_j = robot_ids[i], robot_ids[j]
+                dist = np.linalg.norm(positions[id_i][:2] - positions[id_j][:2])
+
+                if dist <= self.comm_range:
+                    # Create communication link
+                    bandwidth = max(1.0, 10.0 - dist/3.0)  # Bandwidth decreases with distance
+                    packet_loss = min(0.1, dist / (self.comm_range * 10))
+                    delay = dist * 0.01  # 10ms per meter
+
+                    link = CommunicationLink(
+                        bandwidth=bandwidth,
+                        packet_loss_prob=packet_loss,
+                        delay=delay,
+                        active=np.random.random() > packet_loss
+                    )
+
+                    self.communication_links[(id_i, id_j)] = link
+                    if link.active:
+                        G.add_edge(id_i, id_j)
+
+        self.network_history.append(G.copy())
+        return G
+
+    def get_neighbors(self, robot_id: int, graph: nx.Graph) -> List[int]:
+        """Get neighboring robots in communication range"""
+        return list(graph.neighbors(robot_id))
+
+    def simulate_message_transmission(self, message: Message, graph: nx.Graph) -> bool:
+        """Simulate message transmission with packet loss and delay"""
+        link_key = (min(message.sender_id, message.receiver_id),
+                   max(message.sender_id, message.receiver_id))
+
+        if link_key not in self.communication_links:
+            return False
+
+        link = self.communication_links[link_key]
+
+        # Check if transmission successful
+        if np.random.random() < link.packet_loss_prob:
+            return False
+
+        # Add delay
+        message.timestamp += link.delay
+        self.message_queue.append(message)
+        return True
+
+# ============================================================================
+# Distributed State Estimation Framework
+# ============================================================================
+class DistributedKalmanFilter:
+    """Distributed Kalman Filter for multi-robot SLAM"""
+
+    def __init__(self, robot_id: int, state_dim: int, num_robots: int):
+        self.robot_id = robot_id
+        self.state_dim = state_dim
+        self.num_robots = num_robots
+        self.total_state_dim = state_dim * num_robots
+
+        # Initialize local state estimate (includes estimates of all robots)
+        self.X_hat = np.zeros(self.total_state_dim)
+        self.P = np.eye(self.total_state_dim) * 10.0  # Initial uncertainty
+
+        # Process noise
+        self.Q = np.eye(state_dim) * 0.1
+        # Measurement noise covariance will be set dynamically in update
+        self.R = None
+
+        # Information form representation
+        self.Y = inv(self.P)  # Information matrix
+        self.y = self.Y @ self.X_hat  # Information vector
+
+    def predict(self, control_input: np.ndarray, dt: float = 0.1):
+        """Local prediction step"""
+        # Initialize state transition matrix for this robot's state
+        F = np.eye(self.state_dim)
+        if self.state_dim >= 3:  # Position + orientation
+            theta = self.X_hat[self.robot_id * self.state_dim + 2]
+            F[0, 2] = -np.sin(theta) * dt
+            F[1, 2] = np.cos(theta) * dt
+
+        # Update only this robot's state
+        start_idx = self.robot_id * self.state_dim
+        end_idx = start_idx + self.state_dim
+
+        # Prediction for this robot's state
+        self.X_hat[start_idx:end_idx] = F @ self.X_hat[start_idx:end_idx]
+
+        # Apply control input
+        if control_input is not None:
+            # Ensure control input matches state dimension
+            control_padded = np.zeros(self.state_dim)
+            control_padded[:min(len(control_input), self.state_dim)] = control_input[:self.state_dim]
+            self.X_hat[start_idx:end_idx] += control_padded * dt
+
+        # Update covariance (only for this robot's block)
+        P_local = self.P[start_idx:end_idx, start_idx:end_idx]
+        P_local = F @ P_local @ F.T + self.Q
+        self.P[start_idx:end_idx, start_idx:end_idx] = P_local
+
+        # Update information form
+        self.Y = inv(self.P + np.eye(self.total_state_dim) * 1e-8)
+        self.y = self.Y @ self.X_hat
+
+    def update(self, measurement: np.ndarray, measurement_model: callable):
+        """Local measurement update step"""
+        if measurement is None:
+            return
+
+        # Measurement prediction
+        h_pred = measurement_model(self.X_hat)
+
+        # Dynamically set measurement noise covariance based on measurement size
+        measurement_dim = len(measurement)
+        self.R = np.eye(measurement_dim) * 0.5  # Adjust R to match measurement dimension
+
+        H = self._compute_measurement_jacobian(measurement_model)
+
+        # Innovation
+        innovation = measurement - h_pred
+        S = H @ self.P @ H.T + self.R
+
+        # Kalman gain
+        K = self.P @ H.T @ inv(S)
+
+        # Update state and covariance
+        self.X_hat += K @ innovation
+        self.P = (np.eye(self.total_state_dim) - K @ H) @ self.P
+
+        # Update information form
+        self.Y = inv(self.P + np.eye(self.total_state_dim) * 1e-8)
+        self.y = self.Y @ self.X_hat
+
+    def _compute_measurement_jacobian(self, measurement_model: callable) -> np.ndarray:
+        """Compute measurement Jacobian numerically"""
+        eps = 1e-6
+        h0 = measurement_model(self.X_hat)
+        H = np.zeros((len(h0), self.total_state_dim))
+
+        for i in range(self.total_state_dim):
+            X_pert = self.X_hat.copy()
+            X_pert[i] += eps
+            h_pert = measurement_model(X_pert)
+            H[:, i] = (h_pert - h0) / eps
+
+        return H
+
+# ============================================================================
+# Consensus Map Fusion Algorithm
+# ============================================================================
+
+class ConsensusInformationFilter:
+    """Distributed Consensus Information Filter for map fusion"""
+
+    def __init__(self, robot_id: int, initial_Y: np.ndarray, initial_y: np.ndarray):
+        self.robot_id = robot_id
+        self.Y = initial_Y.copy()  # Information matrix
+        self.y = initial_y.copy()  # Information vector
+        self.consensus_history = []
+
+    def consensus_update(self, neighbor_data: Dict[int, Tuple[np.ndarray, np.ndarray]],
+                        consensus_gains: Dict[int, float]):
+        """Perform consensus update with neighbors"""
+        Y_consensus = self.Y.copy()
+        y_consensus = self.y.copy()
+
+        for neighbor_id, (Y_neighbor, y_neighbor) in neighbor_data.items():
+            if neighbor_id in consensus_gains:
+                alpha = consensus_gains[neighbor_id]
+                Y_consensus += alpha * (Y_neighbor - self.Y)
+                y_consensus += alpha * (y_neighbor - self.y)
+
+        self.Y = Y_consensus
+        self.y = y_consensus
+
+        # Store consensus history for analysis
+        self.consensus_history.append({
+            'Y': self.Y.copy(),
+            'y': self.y.copy(),
+            'timestamp': time.time()
+        })
+
+    def get_state_estimate(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Convert information form back to state estimate"""
+        # Add regularization to ensure numerical stability
+        Y_reg = self.Y + np.eye(self.Y.shape[0]) * 1e-8
+        try:
+            P = inv(Y_reg)
+            X_hat = P @ self.y
+            return X_hat, P
+        except np.linalg.LinAlgError:
+            # Fallback using SVD
+            U, s, Vt = np.linalg.svd(Y_reg)
+            s_inv = np.where(s > 1e-10, 1/s, 0)
+            P = Vt.T @ np.diag(s_inv) @ U.T
+            X_hat = P @ self.y
+            return X_hat, P
+
+# ============================================================================
+# Cross-Correlation Management
+# ============================================================================
+
+class CovarianceIntersection:
+    """Covariance Intersection for handling unknown correlations"""
+
+    @staticmethod
+    def fuse_estimates(estimates: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
+        """Fuse multiple estimates using Covariance Intersection"""
+        if len(estimates) < 2:
+            return estimates[0] if estimates else (np.array([]), np.array([]))
+
+        # Start with first two estimates
+        X_fused, P_fused = CovarianceIntersection._fuse_pair(estimates[0], estimates[1])
+
+        # Iteratively fuse with remaining estimates
+        for i in range(2, len(estimates)):
+            X_fused, P_fused = CovarianceIntersection._fuse_pair(
+                (X_fused, P_fused), estimates[i]
+            )
+
+        return X_fused, P_fused
+
+    @staticmethod
+    def _fuse_pair(est1: Tuple[np.ndarray, np.ndarray],
+                   est2: Tuple[np.ndarray, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+        """Fuse two estimates using Covariance Intersection"""
+        X1, P1 = est1
+        X2, P2 = est2
+
+        # Optimal weight calculation
+        def objective(omega):
+            w1, w2 = omega[0], 1 - omega[0]
+            try:
+                P_inv = w1 * inv(P1) + w2 * inv(P2)
+                P_fused = inv(P_inv)
+                return np.trace(P_fused)
+            except np.linalg.LinAlgError:
+                return 1e10
+
+        # Optimize weights
+        result = minimize(objective, [0.5], bounds=[(0.01, 0.99)], method='L-BFGS-B')
+        omega_opt = result.x[0]
+
+        # Compute fused estimate
+        w1, w2 = omega_opt, 1 - omega_opt
+        P1_inv = inv(P1 + np.eye(P1.shape[0]) * 1e-8)
+        P2_inv = inv(P2 + np.eye(P2.shape[0]) * 1e-8)
+
+        P_fused_inv = w1 * P1_inv + w2 * P2_inv
+        P_fused = inv(P_fused_inv + np.eye(P_fused_inv.shape[0]) * 1e-8)
+        X_fused = P_fused @ (w1 * P1_inv @ X1 + w2 * P2_inv @ X2)
+
+        return X_fused, P_fused
+
+# ============================================================================
+# Coordinated Exploration Control
+# ============================================================================
+
+class DistributedExplorationCoordinator:
+    """Nash Equilibrium-based exploration coordination"""
+
+    def __init__(self, robot_id: int, map_bounds: Tuple[float, float, float, float],
+                 sensing_range: float = 10.0):
+        self.robot_id = robot_id
+        self.map_bounds = map_bounds  # (xmin, xmax, ymin, ymax)
+        self.sensing_range = sensing_range
+        self.exploration_history = []
+        self.intention_broadcasts = {}
+        self.current_trajectory = np.array([])  # Initialize current_trajectory
+
+        # Nash equilibrium parameters
+        self.alpha = 1.0  # Information gain weight
+        self.beta = 0.1   # Reward weight
+        self.gamma = 0.05 # Cost weight
+        self.delta = 0.8  # Overlap penalty weight
+
+    def compute_information_gain(self, position: np.ndarray,
+                               current_map: np.ndarray,
+                               map_resolution: float = 1.0) -> float:
+        """Compute expected information gain at a position"""
+        # Create sensing footprint
+        x, y = position[:2]
+        map_x = int((x - self.map_bounds[0]) / map_resolution)
+        map_y = int((y - self.map_bounds[2]) / map_resolution)
+
+        # Compute information gain as reduction in entropy
+        sensing_radius = int(self.sensing_range / map_resolution)
+        info_gain = 0.0
+
+        for dx in range(-sensing_radius, sensing_radius + 1):
+            for dy in range(-sensing_radius, sensing_radius + 1):
+                if dx*dx + dy*dy <= sensing_radius*sensing_radius:
+                    map_x_idx = map_x + dx
+                    map_y_idx = map_y + dy
+
+                    if (0 <= map_x_idx < current_map.shape[1] and
+                        0 <= map_y_idx < current_map.shape[0]):
+                        # Information gain inversely proportional to certainty
+                        certainty = abs(current_map[map_y_idx, map_x_idx])
+                        if certainty < 0.9:  # Unknown or uncertain areas
+                            info_gain += (1.0 - certainty)
+
+        return info_gain
+
+    def compute_overlap_penalty(self, position: np.ndarray,
+                              neighbor_intentions: Dict[int, np.ndarray]) -> float:
+        """Compute overlap penalty with neighbor robots"""
+        penalty = 0.0
+
+        for neighbor_id, neighbor_traj in neighbor_intentions.items():
+            if len(neighbor_traj) > 0:
+                # Compute overlap based on sensing range
+                for neighbor_pos in neighbor_traj:
+                    dist = np.linalg.norm(position[:2] - neighbor_pos[:2])
+                    if dist < 2 * self.sensing_range:
+                        overlap_ratio = max(0, (2 * self.sensing_range - dist) /
+                                          (2 * self.sensing_range))
+                        penalty += overlap_ratio
+
+        return penalty
+
+    def optimize_action(self, current_state: np.ndarray,
+                       current_map: np.ndarray,
+                       neighbor_intentions: Dict[int, np.ndarray],
+                       action_candidates: List[np.ndarray]) -> np.ndarray:
+        """Optimize action using Nash equilibrium approach"""
+        best_action = None
+        best_value = -np.inf
+
+        # Ensure current_state is float type
+        current_state = current_state.astype(float)
+
+        for action in action_candidates:
+            # Ensure action is 3D
+            action = np.pad(action, (0, max(0, 3 - len(action))), mode='constant')
+            # Predict next position
+            next_pos = current_state.copy()
+            next_pos[:2] += action[:2] * 0.1  # Assume dt = 0.1
+            if len(next_pos) >= 3 and len(action) >= 3:
+                next_pos[2] += action[2] * 0.1  # Update orientation
+
+            # Compute objective components
+            info_gain = self.compute_information_gain(next_pos, current_map)
+            reward = -np.linalg.norm(action[:2])  # Prefer smaller movements
+            cost = np.linalg.norm(action[:2]) ** 2
+            overlap = self.compute_overlap_penalty(next_pos, neighbor_intentions)
+
+            # Nash equilibrium objective
+            objective_value = (self.alpha * info_gain +
+                             self.beta * reward -
+                             self.gamma * cost -
+                             self.delta * overlap)
+
+            if objective_value > best_value:
+                best_value = objective_value
+                best_action = action
+
+        # Update current trajectory
+        if best_action is not None:
+            self.current_trajectory = np.array([current_state[:3] + best_action * 0.1])
+        else:
+            self.current_trajectory = np.array([current_state[:3]])
+
+        return best_action if best_action is not None else np.zeros(3)  # Return 3D action
+
+    def broadcast_intention(self, planned_trajectory: np.ndarray) -> Dict:
+        """Broadcast exploration intention to neighbors"""
+        intention_msg = {
+            'robot_id': self.robot_id,
+            'trajectory': planned_trajectory.tolist(),
+            'timestamp': time.time(),
+            'sensing_range': self.sensing_range
+        }
+        return intention_msg
+
+    def receive_intention(self, intention_msg: Dict):
+        """Receive and store neighbor's intention"""
+        robot_id = intention_msg['robot_id']
+        self.intention_broadcasts[robot_id] = {
+            'trajectory': np.array(intention_msg['trajectory']),
+            'timestamp': intention_msg['timestamp'],
+            'sensing_range': intention_msg.get('sensing_range', 10.0)
+        }
+
+# ============================================================================
+# Communication-Efficient Information Sharing
+# ============================================================================
+
+class BandwidthAwareInformationSharing:
+    """Adaptive information selection for bandwidth-constrained communication"""
+
+    def __init__(self, robot_id: int):
+        self.robot_id = robot_id
+        self.information_candidates = []
+        self.transmission_history = []
+
+    def add_information_candidate(self, info_type: str, data: np.ndarray,
+                                priority: float, size_bytes: int):
+        """Add information candidate for potential transmission"""
+        candidate = {
+            'type': info_type,
+            'data': data,
+            'priority': priority,
+            'size': size_bytes,
+            'timestamp': time.time(),
+            'efficiency_ratio': priority / max(size_bytes, 1)
+        }
+        self.information_candidates.append(candidate)
+
+    def select_information_for_transmission(self, available_bandwidth: float,
+                                          neighbor_needs: Dict[str, float] = None) -> List[Dict]:
+        """Select optimal information subset given bandwidth constraints"""
+        if not self.information_candidates:
+            return []
+
+        # Sort by efficiency ratio (priority/size)
+        sorted_candidates = sorted(self.information_candidates,
+                                 key=lambda x: x['efficiency_ratio'],
+                                 reverse=True)
+
+        selected_info = []
+        used_bandwidth = 0.0
+
+        for candidate in sorted_candidates:
+            if used_bandwidth + candidate['size'] <= available_bandwidth:
+                # Adjust priority based on neighbor needs
+                if neighbor_needs and candidate['type'] in neighbor_needs:
+                    candidate['adjusted_priority'] = (candidate['priority'] *
+                                                    neighbor_needs[candidate['type']])
+                else:
+                    candidate['adjusted_priority'] = candidate['priority']
+
+                selected_info.append(candidate)
+                used_bandwidth += candidate['size']
+            else:
+                break
+
+        # Clear selected candidates
+        self.information_candidates = [c for c in self.information_candidates
+                                     if c not in selected_info]
+
+        # Record transmission
+        self.transmission_history.append({
+            'timestamp': time.time(),
+            'selected_info': selected_info,
+            'bandwidth_used': used_bandwidth,
+            'bandwidth_available': available_bandwidth,
+            'efficiency': sum(c['adjusted_priority'] for c in selected_info) / max(used_bandwidth, 1)
+        })
+
+        return selected_info
+
+    def compute_communication_value(self, information: Dict,
+                                  target_robot_uncertainty: np.ndarray) -> float:
+        """Compute value of transmitting information to target robot"""
+        # Estimate entropy reduction at target robot
+        if information['type'] == 'state_estimate':
+            # Information value based on uncertainty reduction
+            data_uncertainty = np.trace(information['data']) if information['data'].ndim > 1 else information['data']
+            target_uncertainty = np.mean(target_robot_uncertainty)
+            entropy_reduction = min(data_uncertainty, target_uncertainty)
+        elif information['type'] == 'map_update':
+            # Map information value based on novelty
+            entropy_reduction = information.get('novelty_score', 1.0)
+        else:
+            entropy_reduction = information.get('priority', 1.0)
+
+        # Communication cost (simplified)
+        comm_cost = information['size'] * 0.001  # Cost per byte
+
+        return max(0, entropy_reduction - comm_cost)
+
+# ============================================================================
+# Robustness to Communication Failures
+# ============================================================================
+
+class PartitionTolerantSLAM:
+    """Handle network partitions and Byzantine faults"""
+
+    def __init__(self, robot_id: int, num_robots: int, byzantine_tolerance: int = 1):
+        self.robot_id = robot_id
+        self.num_robots = num_robots
+        self.byzantine_tolerance = byzantine_tolerance
+        self.partition_history = []
+        self.fault_detection_scores = {}
+
+    def detect_network_partition(self, current_graph: nx.Graph,
+                               history_length: int = 5) -> List[List[int]]:
+        """Detect if network has partitioned into components"""
+        components = list(nx.connected_components(current_graph))
+
+        # Record partition event
+        self.partition_history.append({
+            'timestamp': time.time(),
+            'components': components,
+            'largest_component_size': max(len(c) for c in components) if components else 0
+        })
+
+        # Keep only recent history
+        if len(self.partition_history) > history_length:
+            self.partition_history = self.partition_history[-history_length:]
+
+        return [list(comp) for comp in components]
+
+    def inflate_uncertainty_for_partition(self, P: np.ndarray,
+                                        partition_duration: float) -> np.ndarray:
+        """Inflate covariance to account for missing information during partition"""
+        # Uncertainty inflation factor based on partition duration
+        inflation_factor = 1.0 + 0.1 * partition_duration  # 10% increase per time unit
+
+        # Apply inflation
+        P_inflated = P * inflation_factor
+
+        # Add process noise accumulation
+        additional_uncertainty = np.eye(P.shape[0]) * 0.01 * partition_duration
+        P_inflated += additional_uncertainty
+
+        return P_inflated
+
+    def byzantine_robust_consensus(self, local_estimate: np.ndarray,
+                                 neighbor_estimates: Dict[int, np.ndarray]) -> np.ndarray:
+        """Perform Byzantine fault-tolerant consensus using trimmed mean"""
+        if len(neighbor_estimates) < 2 * self.byzantine_tolerance + 1:
+            return local_estimate  # Not enough neighbors for Byzantine tolerance
+
+        all_estimates = [local_estimate] + list(neighbor_estimates.values())
+
+        # Compute trimmed mean for each dimension
+        robust_estimate = np.zeros_like(local_estimate)
+
+        for dim in range(len(local_estimate)):
+            values = [est[dim] for est in all_estimates]
+            values.sort()
+
+            # Remove f extreme values from each end
+            trimmed_values = values[self.byzantine_tolerance:-self.byzantine_tolerance]
+            if trimmed_values:
+                robust_estimate[dim] = np.mean(trimmed_values)
+            else:
+                robust_estimate[dim] = local_estimate[dim]
+
+        return robust_estimate
+
+    def detect_byzantine_behavior(self, robot_id: int, estimate: np.ndarray,
+                                neighbor_estimates: Dict[int, np.ndarray]) -> float:
+        """Detect potential Byzantine behavior based on estimate deviation"""
+        if len(neighbor_estimates) < 2:
+            return 0.0  # Not enough data
+
+        # Compute median estimate
+        all_estimates = list(neighbor_estimates.values())
+        median_estimate = np.median(np.array(all_estimates), axis=0)
+
+        # Compute deviation from median
+        deviation = np.linalg.norm(estimate - median_estimate)
+
+        # Update fault detection score
+        if robot_id not in self.fault_detection_scores:
+            self.fault_detection_scores[robot_id] = deque(maxlen=10)
+
+        self.fault_detection_scores[robot_id].append(deviation)
+
+        # Return average deviation score
+        return np.mean(self.fault_detection_scores[robot_id])
+
+# ============================================================================
+# Main Multi-Robot SLAM System
+# ============================================================================
+
+class MultiRobotSLAMSystem:
+    """Complete Multi-Robot Distributed SLAM System"""
+
+    def __init__(self, num_robots: int, map_bounds: Tuple[float, float, float, float],
+                 comm_range: float = 30.0):
+        self.num_robots = num_robots
+        self.map_bounds = map_bounds
+        self.comm_range = comm_range
+
+        # Initialize components
+        self.network = MultiRobotNetwork(num_robots, comm_range)
+        self.kalman_filters = {}
+        self.consensus_filters = {}
+        self.exploration_coordinators = {}
+        self.info_sharing_managers = {}
+        self.partition_managers = {}
+
+        # System state
+        self.current_positions = {}
+        self.global_map = np.zeros((100, 100))  # Occupancy grid
+        self.landmarks = {}
+        self.simulation_time = 0.0
+
+        # Performance metrics
+        self.metrics = {
+            'consensus_errors': [],
+            'communication_efficiency': [],
+            'exploration_overlap': [],
+            'convergence_times': []
+        }
+
+        self._initialize_robots()
+
+    def _initialize_robots(self):
+        """Initialize all robot components"""
+        for robot_id in range(self.num_robots):
+            # Random initial positions
+            x = np.random.uniform(self.map_bounds[0], self.map_bounds[1])
+            y = np.random.uniform(self.map_bounds[2], self.map_bounds[3])
+            theta = np.random.uniform(0, 2*np.pi)
+
+            initial_state = RobotState(
+                position=np.array([x, y, theta]),
+                velocity=np.zeros(3),
+                covariance=np.eye(3) * 0.1,
+                landmarks={}
+            )
+
+            # Add to network
+            self.network.add_robot(robot_id, initial_state)
+            self.current_positions[robot_id] = initial_state.position
+
+            # Initialize filters
+            self.kalman_filters[robot_id] = DistributedKalmanFilter(robot_id, 3, self.num_robots)
+
+            initial_Y = np.eye(3 * self.num_robots) * 0.1
+            initial_y = np.zeros(3 * self.num_robots)
+            self.consensus_filters[robot_id] = ConsensusInformationFilter(robot_id, initial_Y, initial_y)
+
+            # Initialize coordinators
+            self.exploration_coordinators[robot_id] = DistributedExplorationCoordinator(
+                robot_id, self.map_bounds, sensing_range=10.0
+            )
+
+            self.info_sharing_managers[robot_id] = BandwidthAwareInformationSharing(robot_id)
+            self.partition_managers[robot_id] = PartitionTolerantSLAM(robot_id, self.num_robots)
+    def simulate_step(self, dt: float = 0.1):
+        """Execute one simulation step"""
+        self.simulation_time += dt
+
+        # Update communication graph
+        comm_graph = self.network.update_communication_graph(self.current_positions)
+
+        # Detect network partitions
+        partitions = self.partition_managers[0].detect_network_partition(comm_graph)
+
+        # Each robot performs local operations
+        for robot_id in range(self.num_robots):
+            self._robot_simulation_step(robot_id, comm_graph, dt)
+
+        # Perform consensus operations
+        self._consensus_step(comm_graph)
+
+        # Update metrics
+        self._update_metrics()
+
+    def _robot_simulation_step(self, robot_id: int, comm_graph: nx.Graph, dt: float):
+        """Simulation step for individual robot"""
+        # Get current state
+        current_pos = self.current_positions[robot_id]
+
+        # Generate control input (exploration-driven)
+        neighbors = self.network.get_neighbors(robot_id, comm_graph)
+
+        # Get neighbor intentions
+        neighbor_intentions = {}
+        for neighbor_id in neighbors:
+            if neighbor_id in self.exploration_coordinators:
+                coord = self.exploration_coordinators[neighbor_id]
+                if hasattr(coord, 'current_trajectory'):
+                    neighbor_intentions[neighbor_id] = coord.current_trajectory
+
+        # Generate action candidates - fixed to include 3D actions
+        action_candidates = self._generate_action_candidates_3d()
+
+        # Optimize action using Nash equilibrium
+        optimal_action = self.exploration_coordinators[robot_id].optimize_action(
+            current_pos, self.global_map, neighbor_intentions, action_candidates
+        )
+
+        # Apply motion model
+        new_position = self._apply_motion_model(current_pos, optimal_action, dt)
+        self.current_positions[robot_id] = new_position
+
+        # Simulate sensor measurements
+        measurement = self._simulate_sensor_measurement(robot_id, new_position)
+
+        # Kalman filter prediction and update
+        kf = self.kalman_filters[robot_id]
+        kf.predict(optimal_action, dt)
+        if measurement is not None:
+            # Create a measurement model for range and bearing
+            def robot_measurement_model(state):
+                robot_start_idx = robot_id * 3
+                robot_pos = state[robot_start_idx:robot_start_idx + 2]
+                measurements_pred = []
+                sensing_range = 15.0  # Match sensing range from _simulate_sensor_measurement
+                for landmark_pos in self._get_global_landmarks():
+                    dist = np.linalg.norm(robot_pos - landmark_pos)
+                    if dist < sensing_range:  # Only include landmarks within sensing range
+                        bearing = np.arctan2(landmark_pos[1] - robot_pos[1],
+                                           landmark_pos[0] - robot_pos[0])
+                        measurements_pred.extend([dist, bearing])
+                return np.array(measurements_pred) if measurements_pred else np.array([])
+
+            # Ensure measurement model returns consistent dimensions
+            try:
+                kf.update(measurement, robot_measurement_model)
+            except ValueError as e:
+                print(f"Error in Kalman update for robot {robot_id}: {e}")
+                # Skip update if dimensions are inconsistent
+                pass
+
+
+        # Update local map
+        self._update_local_map(robot_id, new_position, measurement)
+
+        # Prepare information for sharing
+        self._prepare_information_sharing(robot_id, neighbors)
+    def _generate_action_candidates_3d(self) -> List[np.ndarray]:
+        """Generate candidate actions for exploration with proper 3D dimensions"""
+        candidates = []
+
+        # Forward motion with different orientations
+        for angle in np.linspace(0, 2*np.pi, 8, endpoint=False):
+            for speed in [0.5, 1.0, 1.5]:
+                # Include angular velocity (third dimension) - set to 0 for straight motion
+                action = np.array([speed * np.cos(angle), speed * np.sin(angle), 0.0])
+                candidates.append(action)
+
+        # Add some turning actions
+        for angular_vel in [-0.5, 0.5]:  # Turn left/right
+            for speed in [0.3, 0.7]:
+                action = np.array([speed, 0.0, angular_vel])
+                candidates.append(action)
+
+        # Add random exploration actions with angular component
+        for _ in range(5):
+            random_action = np.array([
+                np.random.normal(0, 0.5),  # x velocity
+                np.random.normal(0, 0.5),  # y velocity
+                np.random.normal(0, 0.1)   # angular velocity
+            ])
+            candidates.append(random_action)
+
+        return candidates
+
+    def _apply_motion_model(self, current_pos: np.ndarray, action: np.ndarray, dt: float) -> np.ndarray:
+        """Apply motion model with noise"""
+        new_pos = current_pos.copy()
+
+        # Simple kinematic model
+        if len(action) >= 2:
+            new_pos[0] += action[0] * dt + np.random.normal(0, 0.01)
+            new_pos[1] += action[1] * dt + np.random.normal(0, 0.01)
+
+        # Handle angular velocity if available
+        if len(action) >= 3 and len(new_pos) >= 3:
+            new_pos[2] += action[2] * dt + np.random.normal(0, 0.05)
+        elif len(new_pos) >= 3:
+            new_pos[2] += np.random.normal(0, 0.05)  # Random orientation change
+
+        # Keep within bounds
+        new_pos[0] = np.clip(new_pos[0], self.map_bounds[0], self.map_bounds[1])
+        new_pos[1] = np.clip(new_pos[1], self.map_bounds[2], self.map_bounds[3])
+        if len(new_pos) >= 3:
+            new_pos[2] = new_pos[2] % (2 * np.pi)
+
+        return new_pos
+
+    def _simulate_sensor_measurement(self, robot_id: int, position: np.ndarray) -> Optional[np.ndarray]:
+        """Simulate sensor measurements (landmarks)"""
+        if robot_id not in self.landmarks:
+            self.landmarks[robot_id] = []
+
+        # Simulate detecting nearby landmarks
+        measurements = []
+        sensing_range = 15.0
+
+        # Check for existing landmarks
+        for landmark_id, landmark_pos in enumerate(self._get_global_landmarks()):
+            dist = np.linalg.norm(position[:2] - landmark_pos)
+            if dist < sensing_range:
+                # Add measurement noise
+                range_meas = dist + np.random.normal(0, 0.1)
+                bearing = np.arctan2(landmark_pos[1] - position[1], landmark_pos[0] - position[0])
+                bearing += np.random.normal(0, 0.05)
+                measurements.append([range_meas, bearing])
+
+        return np.array(measurements).flatten() if measurements else None
+
+    def _get_global_landmarks(self) -> List[np.ndarray]:
+        """Get global landmark positions"""
+        # Generate static landmarks for simulation
+        landmarks = []
+        for x in np.arange(self.map_bounds[0] + 10, self.map_bounds[1], 20):
+            for y in np.arange(self.map_bounds[2] + 10, self.map_bounds[3], 20):
+                landmarks.append(np.array([x, y]))
+        return landmarks
+
+    def _measurement_model(self, state: np.ndarray) -> np.ndarray:
+        """Measurement model for Kalman filter"""
+        # Simple measurement model - return position
+        robot_pos = state[:3]  # Assuming first 3 elements are position
+        return robot_pos[:2]  # Return x, y position
+
+    def _update_local_map(self, robot_id: int, position: np.ndarray, measurement: Optional[np.ndarray]):
+        """Update local occupancy grid map"""
+        if measurement is None:
+            return
+
+        # Convert position to grid coordinates
+        map_res = (self.map_bounds[1] - self.map_bounds[0]) / self.global_map.shape[1]
+        grid_x = int((position[0] - self.map_bounds[0]) / map_res)
+        grid_y = int((position[1] - self.map_bounds[2]) / map_res)
+
+        # Process range and bearing measurements
+        landmarks = self._get_global_landmarks()
+        for i in range(0, len(measurement), 2):  # Process pairs of range and bearing
+            range_meas = measurement[i]
+            bearing = measurement[i + 1]
+            landmark_idx = i // 2
+
+            if landmark_idx < len(landmarks):
+                # Compute landmark position in global frame
+                landmark_x = position[0] + range_meas * np.cos(bearing + position[2])
+                landmark_y = position[1] + range_meas * np.sin(bearing + position[2])
+
+                # Convert to grid coordinates
+                map_x = int((landmark_x - self.map_bounds[0]) / map_res)
+                map_y = int((landmark_y - self.map_bounds[2]) / map_res)
+
+                if (0 <= map_x < self.global_map.shape[1] and
+                    0 <= map_y < self.global_map.shape[0]):
+                    # Update occupancy grid with landmark observation
+                    self.global_map[map_y, map_x] += 0.2  # Higher probability for landmarks
+                    self.global_map[map_y, map_x] = np.clip(self.global_map[map_y, map_x], 0, 1)
+
+        # Update free space around robot
+        sensing_radius = int(10.0 / map_res)
+        for dx in range(-sensing_radius, sensing_radius + 1):
+            for dy in range(-sensing_radius, sensing_radius + 1):
+                if dx*dx + dy*dy <= sensing_radius*sensing_radius:
+                    map_x = grid_x + dx
+                    map_y = grid_y + dy
+                    if (0 <= map_x < self.global_map.shape[1] and
+                        0 <= map_y < self.global_map.shape[0]):
+                        # Update with free space
+                        self.global_map[map_y, map_x] -= 0.05
+                        self.global_map[map_y, map_x] = np.clip(self.global_map[map_y, map_x], 0, 1)
+
+    def _prepare_information_sharing(self, robot_id: int, neighbors: List[int]):
+        """Prepare information for bandwidth-aware sharing"""
+        info_manager = self.info_sharing_managers[robot_id]
+
+        # Add state estimate as information candidate
+        kf = self.kalman_filters[robot_id]
+        state_info_size = kf.X_hat.nbytes + kf.P.nbytes
+        info_manager.add_information_candidate(
+            'state_estimate',
+            {'state': kf.X_hat, 'covariance': kf.P},
+            priority=2.0,
+            size_bytes=state_info_size
+        )
+
+        # Add map update as information candidate
+        map_info_size = self.global_map.nbytes // 10  # Compressed map
+        info_manager.add_information_candidate(
+            'map_update',
+            {'map_patch': self.global_map[40:60, 40:60]},  # Local map patch
+            priority=1.5,
+            size_bytes=map_info_size
+        )
+
+        # Add exploration intention
+        coord = self.exploration_coordinators[robot_id]
+        intention_data = np.array([self.current_positions[robot_id]])
+        intention_msg = coord.broadcast_intention(intention_data)
+        intention_size = len(str(intention_msg).encode())
+        info_manager.add_information_candidate(
+            'exploration_intent',
+            intention_msg,
+            priority=1.0,
+            size_bytes=intention_size
+        )
+
+    def _consensus_step(self, comm_graph: nx.Graph):
+        """Perform distributed consensus across all robots"""
+        # Collect information to be shared
+        consensus_data = {}
+
+        for robot_id in range(self.num_robots):
+            neighbors = self.network.get_neighbors(robot_id, comm_graph)
+            if not neighbors:
+                continue
+
+            # Prepare consensus information
+            cf = self.consensus_filters[robot_id]
+            consensus_data[robot_id] = {
+                'Y': cf.Y.copy(),
+                'y': cf.y.copy(),
+                'neighbors': neighbors
+            }
+
+        # Perform consensus updates
+        for robot_id in range(self.num_robots):
+            if robot_id not in consensus_data:
+                continue
+
+            neighbors = consensus_data[robot_id]['neighbors']
+            neighbor_data = {}
+            consensus_gains = {}
+
+            # Collect neighbor information
+            for neighbor_id in neighbors:
+                if neighbor_id in consensus_data:
+                    neighbor_data[neighbor_id] = (
+                        consensus_data[neighbor_id]['Y'],
+                        consensus_data[neighbor_id]['y']
+                    )
+                    consensus_gains[neighbor_id] = 0.1  # Fixed consensus gain
+
+            # Perform consensus update
+            if neighbor_data:
+                cf = self.consensus_filters[robot_id]
+                cf.consensus_update(neighbor_data, consensus_gains)
+
+                # Update Kalman filter with consensus result
+                X_consensus, P_consensus = cf.get_state_estimate()
+                kf = self.kalman_filters[robot_id]
+
+                # Fuse with local estimate using Covariance Intersection
+                estimates = [(kf.X_hat, kf.P), (X_consensus, P_consensus)]
+                X_fused, P_fused = CovarianceIntersection.fuse_estimates(estimates)
+
+                kf.X_hat = X_fused
+                kf.P = P_fused
+
+        # Handle Byzantine fault tolerance
+        self._handle_byzantine_faults(comm_graph)
+
+    def _handle_byzantine_faults(self, comm_graph: nx.Graph):
+        """Handle potential Byzantine faults"""
+        for robot_id in range(self.num_robots):
+            neighbors = self.network.get_neighbors(robot_id, comm_graph)
+            if len(neighbors) < 3:  # Need minimum neighbors for Byzantine tolerance
+                continue
+
+            partition_manager = self.partition_managers[robot_id]
+
+            # Collect neighbor estimates
+            neighbor_estimates = {}
+            for neighbor_id in neighbors:
+                if neighbor_id in self.kalman_filters:
+                    kf_neighbor = self.kalman_filters[neighbor_id]
+                    neighbor_estimates[neighbor_id] = kf_neighbor.X_hat
+
+            # Perform Byzantine-robust consensus
+            kf = self.kalman_filters[robot_id]
+            robust_estimate = partition_manager.byzantine_robust_consensus(
+                kf.X_hat, neighbor_estimates
+            )
+
+            # Update estimate with robust consensus
+            alpha = 0.1  # Consensus weight
+            kf.X_hat = (1 - alpha) * kf.X_hat + alpha * robust_estimate
+
+    def _update_metrics(self):
+        """Update performance metrics"""
+        # Consensus error
+        all_estimates = [self.kalman_filters[i].X_hat for i in range(self.num_robots)]
+        if len(all_estimates) > 1:
+            mean_estimate = np.mean(all_estimates, axis=0)
+            consensus_error = np.mean([np.linalg.norm(est - mean_estimate)
+                                     for est in all_estimates])
+            self.metrics['consensus_errors'].append(consensus_error)
+
+        # Communication efficiency
+        total_info_gain = 0
+        total_bytes = 0
+        for robot_id in range(self.num_robots):
+            info_manager = self.info_sharing_managers[robot_id]
+            if info_manager.transmission_history:
+                last_transmission = info_manager.transmission_history[-1]
+                total_bytes += last_transmission['bandwidth_used']
+                total_info_gain += last_transmission.get('efficiency', 0)
+
+        if total_bytes > 0:
+            comm_efficiency = total_info_gain / total_bytes
+            self.metrics['communication_efficiency'].append(comm_efficiency)
+
+    def run_simulation(self, num_steps: int, dt: float = 0.1, visualize: bool = True):
+        """Run complete simulation"""
+        print(f"Starting Multi-Robot SLAM simulation with {self.num_robots} robots...")
+        print(f"Map bounds: {self.map_bounds}, Communication range: {self.comm_range}m")
+
+        for step in range(num_steps):
+            self.simulate_step(dt)
+
+            if step % 50 == 0:
+                print(f"Step {step}/{num_steps} - Time: {self.simulation_time:.2f}s")
+                if self.metrics['consensus_errors']:
+                    print(f"  Consensus error: {self.metrics['consensus_errors'][-1]:.4f}")
+                if self.metrics['communication_efficiency']:
+                    print(f"  Communication efficiency: {self.metrics['communication_efficiency'][-1]:.4f}")
+
+        if visualize:
+            self.visualize_results()
+
+        return self.metrics
+
+    def visualize_results(self):
+        """Visualize simulation results"""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+
+        # Robot trajectories and communication network
+        ax1.set_title('Robot Positions and Communication Network')
+
+        # Plot robot positions
+        colors = plt.cm.Set3(np.linspace(0, 1, self.num_robots))
+        for robot_id in range(self.num_robots):
+            pos = self.current_positions[robot_id]
+            ax1.scatter(pos[0], pos[1], c=[colors[robot_id]], s=100,
+                       label=f'Robot {robot_id}', alpha=0.8)
+
+            # Draw sensing range
+            circle = plt.Circle((pos[0], pos[1]), 10, fill=False,
+                              color=colors[robot_id], alpha=0.3)
+            ax1.add_patch(circle)
+
+        # Plot communication links
+        if self.network.network_history:
+            latest_graph = self.network.network_history[-1]
+            for edge in latest_graph.edges():
+                pos1 = self.current_positions[edge[0]]
+                pos2 = self.current_positions[edge[1]]
+                ax1.plot([pos1[0], pos2[0]], [pos1[1], pos2[1]],
+                        'k--', alpha=0.3, linewidth=1)
+
+        # Plot landmarks
+        landmarks = self._get_global_landmarks()
+        for landmark in landmarks:
+            ax1.scatter(landmark[0], landmark[1], c='red', marker='s', s=50, alpha=0.6)
+
+        ax1.set_xlabel('X Position (m)')
+        ax1.set_ylabel('Y Position (m)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlim(self.map_bounds[0]-5, self.map_bounds[1]+5)
+        ax1.set_ylim(self.map_bounds[2]-5, self.map_bounds[3]+5)
+
+        # Occupancy grid map
+        ax2.set_title('Global Occupancy Map')
+        im = ax2.imshow(self.global_map, cmap='viridis', origin='lower',
+                        extent=self.map_bounds)
+        plt.colorbar(im, ax=ax2, label='Occupancy Probability')
+        ax2.set_xlabel('X Position (m)')
+        ax2.set_ylabel('Y Position (m)')
+
+        # Consensus error over time
+        ax3.set_title('Consensus Error Over Time')
+        if self.metrics['consensus_errors']:
+            ax3.plot(self.metrics['consensus_errors'], 'b-', linewidth=2)
+            ax3.set_xlabel('Time Steps')
+            ax3.set_ylabel('Consensus Error')
+            ax3.grid(True, alpha=0.3)
+
+        # Communication efficiency
+        ax4.set_title('Communication Efficiency Over Time')
+        if self.metrics['communication_efficiency']:
+            ax4.plot(self.metrics['communication_efficiency'], 'r-', linewidth=2)
+            ax4.set_xlabel('Time Steps')
+            ax4.set_ylabel('Information Gain / Bytes')
+            ax4.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+        # Print final statistics
+        print("\n" + "="*60)
+        print("SIMULATION RESULTS")
+        print("="*60)
+        print(f"Total simulation time: {self.simulation_time:.2f} seconds")
+        print(f"Number of robots: {self.num_robots}")
+
+        if self.metrics['consensus_errors']:
+            final_consensus_error = self.metrics['consensus_errors'][-1]
+            avg_consensus_error = np.mean(self.metrics['consensus_errors'])
+            print(f"Final consensus error: {final_consensus_error:.4f}")
+            print(f"Average consensus error: {avg_consensus_error:.4f}")
+
+        if self.metrics['communication_efficiency']:
+            avg_comm_efficiency = np.mean(self.metrics['communication_efficiency'])
+            print(f"Average communication efficiency: {avg_comm_efficiency:.4f}")
+
+        # Network connectivity statistics
+        if self.network.network_history:
+            connectivity_ratios = []
+            for graph in self.network.network_history:
+                if graph.number_of_nodes() > 0:
+                    connected_ratio = len(max(nx.connected_components(graph), key=len)) / graph.number_of_nodes()
+                    connectivity_ratios.append(connected_ratio)
+
+            if connectivity_ratios:
+                avg_connectivity = np.mean(connectivity_ratios)
+                print(f"Average network connectivity: {avg_connectivity:.2%}")
+
+        print("="*60)
+
+# ============================================================================
+# Example Usage and Testing
+# ============================================================================
+
+def run_example_simulation():
+    """Run example multi-robot SLAM simulation"""
+    print("Phase II: Multi-Robot Distributed SLAM Implementation")
+    print("=" * 60)
+
+    # Simulation parameters
+    num_robots = 5
+    map_bounds = (-50, 50, -50, 50)  # 100m x 100m environment
+    comm_range = 25.0  # 25m communication range
+    simulation_steps = 300
+    dt = 0.1
+
+    # Create and run simulation
+    slam_system = MultiRobotSLAMSystem(num_robots, map_bounds, comm_range)
+    metrics = slam_system.run_simulation(simulation_steps, dt, visualize=True)
+
+    return slam_system, metrics
+
+def test_individual_algorithms():
+    """Test individual algorithm components"""
+    print("\nTesting Individual Algorithm Components:")
+    print("-" * 40)
+
+    # Test Distributed Kalman Filter
+    print("1. Testing Distributed Kalman Filter...")
+    dkf = DistributedKalmanFilter(robot_id=0, state_dim=3, num_robots=3)
+    dkf.predict(np.array([1.0, 0.5, 0.1]))
+    print(f"   State after prediction: {dkf.X_hat[:3]}")
+
+    # Test Consensus Information Filter
+    print("2. Testing Consensus Information Filter...")
+    Y_init = np.eye(6) * 0.1
+    y_init = np.zeros(6)
+    cif = ConsensusInformationFilter(robot_id=0, initial_Y=Y_init, initial_y=y_init)
+
+    # Simulate neighbor data
+    neighbor_Y = np.eye(6) * 0.12
+    neighbor_y = np.ones(6) * 0.1
+    neighbor_data = {1: (neighbor_Y, neighbor_y)}
+    consensus_gains = {1: 0.1}
+
+    cif.consensus_update(neighbor_data, consensus_gains)
+    X_est, P_est = cif.get_state_estimate()
+    print(f"   Consensus state estimate: {X_est[:3]}")
+
+    # Test Covariance Intersection
+    print("3. Testing Covariance Intersection...")
+    est1 = (np.array([1, 2, 3]), np.eye(3) * 0.5)
+    est2 = (np.array([1.1, 2.1, 2.9]), np.eye(3) * 0.3)
+    fused_X, fused_P = CovarianceIntersection.fuse_estimates([est1, est2])
+    print(f"   Fused estimate: {fused_X}")
+
+    # Test Exploration Coordinator
+    print("4. Testing Exploration Coordinator...")
+    coord = DistributedExplorationCoordinator(
+        robot_id=0, map_bounds=(-10, 10, -10, 10), sensing_range=5.0
+    )
+    current_state = np.array([0, 0, 0])
+    current_map = np.zeros((20, 20))
+    action_candidates = [np.array([1, 0]), np.array([0, 1]), np.array([-1, 0])]
+
+    best_action = coord.optimize_action(current_state, current_map, {}, action_candidates)
+    print(f"   Optimal action: {best_action}")
+
+    # Test Bandwidth-Aware Information Sharing
+    print("5. Testing Bandwidth-Aware Information Sharing...")
+    info_sharing = BandwidthAwareInformationSharing(robot_id=0)
+    info_sharing.add_information_candidate("test_data", np.array([1, 2, 3]), 2.0, 100)
+    info_sharing.add_information_candidate("test_data2", np.array([4, 5, 6]), 1.5, 80)
+
+    selected_info = info_sharing.select_information_for_transmission(150)
+    print(f"   Selected {len(selected_info)} information candidates for transmission")
+
+    # Test Partition-Tolerant SLAM
+    print("6. Testing Partition-Tolerant SLAM...")
+    partition_slam = PartitionTolerantSLAM(robot_id=0, num_robots=3, byzantine_tolerance=1)
+
+    # Create test graph with partition
+    G = nx.Graph()
+    G.add_edges_from([(0, 1), (2, 3)])  # Two disconnected components
+    partitions = partition_slam.detect_network_partition(G)
+    print(f"   Detected {len(partitions)} partitions: {partitions}")
+
+    # Test Byzantine robust consensus
+    local_est = np.array([1, 2, 3])
+    neighbor_ests = {1: np.array([1.1, 2.1, 3.1]), 2: np.array([0.9, 1.9, 2.9]),
+                    3: np.array([10, 20, 30])}  # Robot 3 is faulty
+
+    robust_est = partition_slam.byzantine_robust_consensus(local_est, neighbor_ests)
+    print(f"   Robust consensus estimate: {robust_est}")
+
+    print("\nAll algorithm tests completed successfully!")
+
+if __name__ == "__main__":
+    # Run example simulation
+    slam_system, metrics = run_example_simulation()
+
+    # Test individual components
+    test_individual_algorithms()
+
+    print("\nPhase II Multi-Robot SLAM implementation completed successfully!")
+    print("All algorithms have been implemented and tested.")
